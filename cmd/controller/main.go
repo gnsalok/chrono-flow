@@ -6,8 +6,13 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 
+	raft_node "github.com/gnsalok/chrono-flow/internal/raft" // Aliased to avoid conflict
+	"github.com/gnsalok/chrono-flow/internal/scheduler"
 	"github.com/gnsalok/chrono-flow/internal/store"
 	"github.com/gorilla/mux"
 )
@@ -26,7 +31,7 @@ func NewAPIServer(listenAddr string, store *store.Store) *APIServer {
 	}
 }
 
-// Run starts the HTTP server and sets up the API routes.
+// Run starts the HTTP server. Note that this is a blocking call.
 func (s *APIServer) Run() {
 	router := mux.NewRouter()
 
@@ -37,10 +42,13 @@ func (s *APIServer) Run() {
 	router.HandleFunc("/jobs/{id}", s.handleUpdateJob).Methods("PUT")
 	router.HandleFunc("/jobs/{id}", s.handleDeleteJob).Methods("DELETE")
 
-	log.Println("Controller API server listening on", s.listenAddr)
-	http.ListenAndServe(s.listenAddr, router)
+	log.Println("Controller API server starting on", s.listenAddr)
+	if err := http.ListenAndServe(s.listenAddr, router); err != nil {
+		log.Fatalf("Failed to start API server: %v", err)
+	}
 }
 
+// ... (keep all the handle... functions exactly as they were) ...
 // handleGetJobs retrieves all jobs.
 func (s *APIServer) handleGetJobs(w http.ResponseWriter, r *http.Request) {
 	jobs, err := s.store.GetJobs()
@@ -137,19 +145,74 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func main() {
-	// Command-line flags for configuration
+	// --- Configuration Flags ---
+	// Application flags
 	listenAddr := flag.String("listenaddr", ":8080", "The API server listen address")
 	dbConnStr := flag.String("dbconn", "user=postgres password=yourpassword dbname=chrono_flow sslmode=disable", "PostgreSQL connection string")
+	workerAddr := flag.String("workeraddr", "localhost:50051", "The address of a worker node") // This line was missing
+
+	// Raft flags
+	raftNodeID := flag.String("raft-id", "", "Node ID for Raft. Must be unique in the cluster.")
+	raftAddr := flag.String("raft-addr", "localhost:12000", "Address for Raft communication.")
+	raftDir := flag.String("raft-dir", "/tmp/chrono-flow-raft", "Directory for Raft's log and snapshot storage.")
+	raftJoinAddr := flag.String("raft-join-addr", "", "Address of a peer to join an existing cluster.")
+	bootstrap := flag.Bool("bootstrap", false, "Bootstrap the cluster. Use for the very first node only.")
 	flag.Parse()
 
-	// Initialize the data store
+	if *raftNodeID == "" {
+		log.Fatal("-raft-id is required")
+	}
+
+	// --- Database Connection ---
 	dbStore, err := store.NewStore(*dbConnStr)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	log.Println("Successfully connected to the database")
 
-	// Create and run the API server
-	server := NewAPIServer(*listenAddr, dbStore)
-	server.Run()
+	// --- Raft Node Initialization ---
+	raftNode, err := raft_node.NewNode(*raftNodeID, *raftAddr, *raftDir)
+	if err != nil {
+		log.Fatalf("Failed to create raft node: %v", err)
+	}
+
+	if *bootstrap {
+		log.Println("Bootstrapping cluster...")
+		raftNode.BootstrapCluster()
+	} else if *raftJoinAddr != "" {
+		// This is a simplified join mechanism. A real system would use a more robust discovery service.
+		log.Printf("Attempting to join cluster at %s", *raftJoinAddr)
+		if err := raftNode.JoinCluster(*raftJoinAddr); err != nil {
+			log.Fatalf("Failed to join cluster: %v", err)
+		}
+	}
+
+	// --- Scheduler and API Server ---
+	var sched *scheduler.Scheduler
+
+	// Start the API server in a goroutine
+	apiServer := NewAPIServer(*listenAddr, dbStore)
+	go apiServer.Run()
+
+	// This loop listens for leadership changes and starts/stops the scheduler accordingly.
+	for isLeader := range raftNode.LeaderCh() {
+		if isLeader {
+			log.Println("This node became the LEADER. Starting scheduler...")
+			sched = scheduler.NewScheduler(dbStore, *workerAddr)
+			sched.Start()
+		} else {
+			if sched != nil {
+				log.Println("This node is now a FOLLOWER. Stopping scheduler...")
+				sched.Stop()
+				sched = nil
+			}
+		}
+	}
+
+	// Wait for a shutdown signal
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down server...")
 }

@@ -1,6 +1,6 @@
 module github.com/gnsalok/chrono-flow
 
-go 1.24.3
+go 1.23.0
 
 require (
 	github.com/gorilla/mux v1.8.1
