@@ -1,0 +1,38 @@
+// internal/proto/tasks.proto
+
+// Specifies that we are using proto3 syntax.
+syntax = "proto3";
+
+// Defines the package name for the generated Go code.
+// This helps prevent naming conflicts.
+package proto;
+
+// The option go_package specifies the full Go import path for the generated code.
+option go_package = "github.com/your-username/chrono-flow/internal/proto";
+
+// The TaskService defines the RPC methods our worker will expose.
+service TaskService {
+  // The Execute method allows the controller to send a task to a worker.
+  // It's a simple RPC that takes a TaskRequest and returns a TaskResponse.
+  rpc Execute(TaskRequest) returns (TaskResponse) {}
+}
+
+// The TaskRequest message contains the details of the job to be executed.
+message TaskRequest {
+  // A unique identifier for this specific task execution.
+  string id = 1;
+  // The shell command that the worker needs to run.
+  string command = 2;
+}
+
+// The TaskResponse message contains the result of the task execution.
+message TaskResponse {
+  // The unique identifier from the request, to correlate response with request.
+  string id = 1;
+  // The standard output captured from the executed command.
+  string stdout = 2;
+  // The standard error captured from the executed command.
+  string stderr = 3;
+  // The exit code of the command. 0 typically means success.
+  int32 exit_code = 4;
+}

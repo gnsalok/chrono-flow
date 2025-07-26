@@ -1,0 +1,95 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  # The PostgreSQL Database Service
+  db:
+    image: postgres:14-alpine
+    container_name: chrono-db
+    environment:
+      # IMPORTANT: Change 'yourpassword' to a secure password.
+      - POSTGRES_PASSWORD=yourpassword
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=chrono_flow
+    ports:
+      # Expose the database on port 5432 for local debugging if needed.
+      - "5432:5432"
+    volumes:
+      # Persist database data on the host machine.
+      - postgres_data:/var/lib/postgresql/data
+      # Run our schema.sql file on startup to create tables.
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d chrono_flow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # The Worker Node
+  worker1:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    container_name: chrono-worker-1
+    command: --port=50051
+    ports:
+      - "50051:50051"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # --- The Controller Cluster ---
+  controller1:
+    build:
+      context: .
+      dockerfile: controller/Dockerfile
+    container_name: chrono-controller-1
+    ports:
+      - "8080:8080" # API port
+      - "12000:12000" # Raft port
+    command: >
+      -dbconn="host=db user=postgres password=yourpassword dbname=chrono_flow sslmode=disable"
+      -workeraddr="worker1:50051"
+      -raft-id="controller1"
+      -raft-addr="controller1:12000"
+      -bootstrap
+    depends_on:
+      db:
+        condition: service_healthy
+
+  controller2:
+    build:
+      context: .
+      dockerfile: controller/Dockerfile
+    container_name: chrono-controller-2
+    ports:
+      - "8081:8080" # API port on host 8081
+      - "12001:12000" # Raft port on host 12001
+    command: >
+      -dbconn="host=db user=postgres password=yourpassword dbname=chrono_flow sslmode=disable"
+      -workeraddr="worker1:50051"
+      -raft-id="controller2"
+      -raft-addr="controller2:12000"
+      -raft-join-addr="controller1:12000"
+    depends_on:
+      - controller1
+
+  controller3:
+    build:
+      context: .
+      dockerfile: controller/Dockerfile
+    container_name: chrono-controller-3
+    ports:
+      - "8082:8080" # API port on host 8082
+      - "12002:12000" # Raft port on host 12002
+    command: >
+      -dbconn="host=db user=postgres password=yourpassword dbname=chrono_flow sslmode=disable"
+      -workeraddr="worker1:50051"
+      -raft-id="controller3"
+      -raft-addr="controller3:12000"
+      -raft-join-addr="controller1:12000"
+    depends_on:
+      - controller1
+
+volumes:
+  postgres_data:
