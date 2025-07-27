@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	raft_node "github.com/gnsalok/chrono-flow/internal/raft" // Aliased to avoid conflict
 	"github.com/gnsalok/chrono-flow/internal/scheduler"
@@ -21,13 +22,15 @@ import (
 type APIServer struct {
 	listenAddr string
 	store      *store.Store
+	raftNode   *raft_node.Node // Add a reference to the Raft node
 }
 
 // NewAPIServer creates a new APIServer instance.
-func NewAPIServer(listenAddr string, store *store.Store) *APIServer {
+func NewAPIServer(listenAddr string, store *store.Store, raftNode *raft_node.Node) *APIServer {
 	return &APIServer{
 		listenAddr: listenAddr,
 		store:      store,
+		raftNode:   raftNode,
 	}
 }
 
@@ -42,10 +45,36 @@ func (s *APIServer) Run() {
 	router.HandleFunc("/jobs/{id}", s.handleUpdateJob).Methods("PUT")
 	router.HandleFunc("/jobs/{id}", s.handleDeleteJob).Methods("DELETE")
 
+	// Add the new endpoint for joining the cluster
+	router.HandleFunc("/join", s.handleJoin).Methods("POST")
+
 	log.Println("Controller API server starting on", s.listenAddr)
 	if err := http.ListenAndServe(s.listenAddr, router); err != nil {
 		log.Fatalf("Failed to start API server: %v", err)
 	}
+}
+
+// handleJoin processes a request from a new node to join the cluster.
+func (s *APIServer) handleJoin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		NodeID   string `json:"nodeId"`
+		RaftAddr string `json:"raftAddr"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.raftNode.Join(req.NodeID, req.RaftAddr); err != nil {
+		log.Printf("Failed to handle join request: %v", err)
+		// This could be because this node is not the leader.
+		// The client is expected to retry.
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Successfully handled join request for node %s at %s", req.NodeID, req.RaftAddr)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "success"})
 }
 
 // ... (keep all the handle... functions exactly as they were) ...
@@ -146,16 +175,14 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func main() {
 	// --- Configuration Flags ---
-	// Application flags
 	listenAddr := flag.String("listenaddr", ":8080", "The API server listen address")
 	dbConnStr := flag.String("dbconn", "user=postgres password=yourpassword dbname=chrono_flow sslmode=disable", "PostgreSQL connection string")
-	workerAddr := flag.String("workeraddr", "localhost:50051", "The address of a worker node") // This line was missing
+	workerAddr := flag.String("workeraddr", "localhost:50051", "The address of a worker node")
 
-	// Raft flags
 	raftNodeID := flag.String("raft-id", "", "Node ID for Raft. Must be unique in the cluster.")
 	raftAddr := flag.String("raft-addr", "localhost:12000", "Address for Raft communication.")
 	raftDir := flag.String("raft-dir", "/tmp/chrono-flow-raft", "Directory for Raft's log and snapshot storage.")
-	raftJoinAddr := flag.String("raft-join-addr", "", "Address of a peer to join an existing cluster.")
+	raftJoinAddr := flag.String("raft-join-addr", "", "HTTP address of a peer to join an existing cluster (e.g. http://localhost:8080).")
 	bootstrap := flag.Bool("bootstrap", false, "Bootstrap the cluster. Use for the very first node only.")
 	flag.Parse()
 
@@ -180,18 +207,27 @@ func main() {
 		log.Println("Bootstrapping cluster...")
 		raftNode.BootstrapCluster()
 	} else if *raftJoinAddr != "" {
-		// This is a simplified join mechanism. A real system would use a more robust discovery service.
-		log.Printf("Attempting to join cluster at %s", *raftJoinAddr)
-		if err := raftNode.JoinCluster(*raftJoinAddr); err != nil {
-			log.Fatalf("Failed to join cluster: %v", err)
-		}
+		// Start a goroutine that will repeatedly try to join the cluster
+		// via the specified peer's HTTP API.
+		go func() {
+			for {
+				log.Printf("Attempting to join cluster via peer at %s", *raftJoinAddr)
+				err := raftNode.JoinCluster(*raftJoinAddr)
+				if err == nil {
+					log.Println("Successfully joined cluster.")
+					break // Exit the loop on success
+				}
+				log.Printf("Failed to join cluster: %v. Retrying in 5 seconds...", err)
+				time.Sleep(5 * time.Second)
+			}
+		}()
 	}
 
 	// --- Scheduler and API Server ---
 	var sched *scheduler.Scheduler
 
-	// Start the API server in a goroutine
-	apiServer := NewAPIServer(*listenAddr, dbStore)
+	// Pass the raft node to the API server
+	apiServer := NewAPIServer(*listenAddr, dbStore, raftNode)
 	go apiServer.Run()
 
 	// This loop listens for leadership changes and starts/stops the scheduler accordingly.

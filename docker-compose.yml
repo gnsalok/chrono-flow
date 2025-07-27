@@ -40,11 +40,13 @@ services:
   controller1:
     build:
       context: .
-      dockerfile: ./cmd/controller/Dockerfile
+      dockerfile: ./cmd/controller/Dockerfile # Corrected Path
     container_name: chrono-controller-1
     ports:
       - "8080:8080" # API port
       - "12000:12000" # Raft port
+    volumes:
+      - raft_data_c1:/tmp/chrono-flow-raft # Persistent Raft state
     command: >
       -dbconn="host=db user=${POSTGRES_USER} password=${POSTGRES_PASSWORD} dbname=chrono_flow sslmode=disable"
       -workeraddr="worker1:50051"
@@ -63,12 +65,14 @@ services:
     ports:
       - "8081:8080" # API port on host 8081
       - "12001:12000" # Raft port on host 12001
+    volumes:
+      - raft_data_c2:/tmp/chrono-flow-raft # Persistent Raft state
     command: >
       -dbconn="host=db user=${POSTGRES_USER} password=${POSTGRES_PASSWORD} dbname=chrono_flow sslmode=disable"
       -workeraddr="worker1:50051"
       -raft-id="controller2"
       -raft-addr="controller2:12000"
-      -raft-join-addr="controller1:12000"
+      -raft-join-addr="http://controller1:8080"
     depends_on:
       - controller1
 
@@ -80,14 +84,19 @@ services:
     ports:
       - "8082:8080" # API port on host 8082
       - "12002:12000" # Raft port on host 12002
+    volumes:
+      - raft_data_c3:/tmp/chrono-flow-raft # Persistent Raft state
     command: >
       -dbconn="host=db user=${POSTGRES_USER} password=${POSTGRES_PASSWORD} dbname=chrono_flow sslmode=disable"
       -workeraddr="worker1:50051"
       -raft-id="controller3"
       -raft-addr="controller3:12000"
-      -raft-join-addr="controller1:12000"
+      -raft-join-addr="http://controller1:8080"
     depends_on:
       - controller1
 
 volumes:
   postgres_data:
+  raft_data_c1:
+  raft_data_c2:
+  raft_data_c3:

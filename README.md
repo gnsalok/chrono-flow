@@ -93,7 +93,7 @@ To stop and remove all containers, run:
 ```bash
 docker-compose down
 ```
-
+```
 
 ## Lead Maintainer
 - [Alok Tripathi](https://github.com/gnsalok)

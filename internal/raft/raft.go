@@ -2,10 +2,13 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -15,8 +18,6 @@ import (
 )
 
 // fsm is a no-op implementation of the raft.FSM interface.
-// For our use case, we only care about leadership changes, not replicating data via the FSM.
-// The primary state (jobs) is in PostgreSQL, managed by the leader.
 type fsm struct{}
 
 func (f *fsm) Apply(*raft.Log) interface{}         { return nil }
@@ -32,7 +33,7 @@ func (s *fsmSnapshot) Release()                             {}
 type Node struct {
 	config    *raft.Config
 	raft      *raft.Raft
-	transport raft.Transport // We store the transport to access its address later.
+	transport raft.Transport
 }
 
 // NewNode creates a new Raft node.
@@ -45,7 +46,6 @@ func NewNode(nodeID, raftAddr, raftDir string) (*Node, error) {
 		return nil, fmt.Errorf("failed to create raft directory: %w", err)
 	}
 
-	// Setup the transport layer for Raft nodes to communicate
 	addr, err := net.ResolveTCPAddr("tcp", raftAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve tcp addr: %w", err)
@@ -55,19 +55,16 @@ func NewNode(nodeID, raftAddr, raftDir string) (*Node, error) {
 		return nil, fmt.Errorf("failed to create tcp transport: %w", err)
 	}
 
-	// Setup the snapshot store
 	snapshots, err := raft.NewFileSnapshotStore(raftDir, 2, os.Stderr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create snapshot store: %w", err)
 	}
 
-	// Setup the log store (using BoltDB)
 	logStore, err := raftboltdb.NewBoltStore(filepath.Join(raftDir, "raft.db"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create bolt store: %w", err)
 	}
 
-	// Create the Raft instance
 	ra, err := raft.NewRaft(config, &fsm{}, logStore, logStore, snapshots, transport)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create raft instance: %w", err)
@@ -76,48 +73,81 @@ func NewNode(nodeID, raftAddr, raftDir string) (*Node, error) {
 	return &Node{
 		config:    config,
 		raft:      ra,
-		transport: transport, // Store the created transport.
+		transport: transport,
 	}, nil
 }
 
-// BootstrapCluster starts the Raft node and bootstraps the cluster if it's the first node.
-// This should only be done on one node, or if the cluster is being created from scratch.
+// BootstrapCluster starts the Raft node and bootstraps the cluster.
 func (n *Node) BootstrapCluster() {
 	bootstrapConfig := raft.Configuration{
 		Servers: []raft.Server{
 			{
 				ID:      n.config.LocalID,
-				Address: n.transport.LocalAddr(), // Use the stored transport's address.
+				Address: n.transport.LocalAddr(),
 			},
 		},
 	}
 	n.raft.BootstrapCluster(bootstrapConfig)
 }
 
-// JoinCluster attempts to join an existing cluster by contacting a peer.
-// NOTE: This is a simplified join mechanism. In a production system, you would typically
-// have a separate API endpoint on the leader to handle join requests securely.
-func (n *Node) JoinCluster(peerRaftAddr string) error {
-	log.Printf("Attempting to join cluster via peer at %s", peerRaftAddr)
+// Join is called by the leader to add a new node to the cluster.
+func (n *Node) Join(nodeID, raftAddr string) error {
+	if n.raft.State() != raft.Leader {
+		return fmt.Errorf("node is not the leader")
+	}
 
-	// The AddVoter call must be made to the leader of the cluster.
-	// The Raft library will handle forwarding the request if this node is not the leader.
-	// However, for a node to even know who the leader is, it must be part of the cluster.
-	// This simplified approach requires a more complex join dance or a discovery service.
-	// A common pattern is to make an out-of-band API call to a known node,
-	// which then as the leader adds the new node as a voter.
+	log.Printf("Received join request for node %s at %s", nodeID, raftAddr)
+	configFuture := n.raft.GetConfiguration()
+	if err := configFuture.Error(); err != nil {
+		return fmt.Errorf("failed to get raft configuration: %w", err)
+	}
 
-	// For the purpose of this project, we assume a simplified model where we just add
-	// ourselves as a voter. The Raft library handles the internal RPC to the leader.
-	// A more robust implementation would involve a proper discovery and join API.
-	if err := n.raft.AddVoter(n.config.LocalID, raft.ServerAddress(peerRaftAddr), 0, 0).Error(); err != nil {
-		return fmt.Errorf("failed to add self as voter via peer %s: %w", peerRaftAddr, err)
+	// Check if the node is already a part of the cluster
+	for _, srv := range configFuture.Configuration().Servers {
+		if srv.ID == raft.ServerID(nodeID) {
+			log.Printf("Node %s already in cluster, skipping join", nodeID)
+			return nil
+		}
+	}
+
+	future := n.raft.AddVoter(raft.ServerID(nodeID), raft.ServerAddress(raftAddr), 0, 0)
+	if err := future.Error(); err != nil {
+		return fmt.Errorf("failed to add voter: %w", err)
+	}
+
+	log.Printf("Node %s at %s joined successfully", nodeID, raftAddr)
+	return nil
+}
+
+// JoinCluster is called by a new node to join an existing cluster.
+func (n *Node) JoinCluster(peerHttpAddr string) error {
+	joinReq := struct {
+		NodeID   string `json:"nodeId"`
+		RaftAddr string `json:"raftAddr"`
+	}{
+		NodeID:   string(n.config.LocalID),
+		RaftAddr: string(n.transport.LocalAddr()),
+	}
+
+	reqBytes, err := json.Marshal(joinReq)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.Post(fmt.Sprintf("%s/join", peerHttpAddr), "application/json", bytes.NewReader(reqBytes))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to join cluster, peer returned: %s", resp.Status)
 	}
 
 	return nil
 }
 
-// LeaderCh returns a channel that notifies when the node becomes a leader or loses leadership.
+// LeaderCh returns a channel that notifies on leadership changes.
 func (n *Node) LeaderCh() <-chan bool {
 	return n.raft.LeaderCh()
 }
